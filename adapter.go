@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"runtime"
 	"strings"
 	"time"
@@ -27,7 +28,6 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
-	"go.mongodb.org/mongo-driver/x/bsonx"
 	"go.mongodb.org/mongo-driver/x/mongo/driver/connstring"
 )
 
@@ -48,45 +48,10 @@ type CasbinRule struct {
 
 // adapter represents the MongoDB adapter for policy storage.
 type adapter struct {
-	collectionName string
-	databaseName   string
-	clientOption   *options.ClientOptions
-	client         *mongo.Client
-	timeout        time.Duration
-	filtered       bool
-}
-
-func (a *adapter) Client(ctx context.Context) *mongo.Client {
-	if a.client != nil && a.client.Ping(ctx, nil) == nil {
-		return a.client
-	}
-
-	client, err := mongo.Connect(ctx, a.clientOption)
-	if err != nil {
-		return nil
-	}
-
-	a.client = client
-
-	return a.client
-}
-
-func (a *adapter) Collection(ctx context.Context) *mongo.Collection {
-	if a.databaseName == "" || a.collectionName == "" {
-		return nil
-	}
-
-	client := a.Client(ctx)
-	if client == nil {
-		return nil
-	}
-	db := client.Database(a.databaseName)
-	if db == nil {
-		return nil
-	}
-	collection := db.Collection(a.collectionName)
-
-	return collection
+	client     *mongo.Client
+	collection *mongo.Collection
+	timeout    time.Duration
+	filtered   bool
 }
 
 // finalizer is the destructor for adapter.
@@ -136,12 +101,8 @@ func NewAdapterWithCollectionName(clientOption *options.ClientOptions, databaseN
 
 // baseNewAdapter is a base constructor for Adapter
 func baseNewAdapter(clientOption *options.ClientOptions, databaseName string, collectionName string, timeout ...interface{}) (persist.BatchAdapter, error) {
-	a := &adapter{
-		clientOption: clientOption,
-	}
+	a := &adapter{}
 	a.filtered = false
-	a.databaseName = databaseName
-	a.collectionName = collectionName
 
 	if len(timeout) == 1 {
 		a.timeout = timeout[0].(time.Duration)
@@ -152,7 +113,7 @@ func baseNewAdapter(clientOption *options.ClientOptions, databaseName string, co
 	}
 
 	// Open the DB, create it if not existed.
-	err := a.open(databaseName, collectionName)
+	err := a.open(clientOption, databaseName, collectionName)
 	if err != nil {
 		return nil, err
 	}
@@ -175,22 +136,63 @@ func NewFilteredAdapter(url string) (persist.FilteredAdapter, error) {
 	return a.(*adapter), nil
 }
 
-func (a *adapter) open(databaseName string, collectionName string) error {
+type AdapterConfig struct {
+	DatabaseName   string
+	CollectionName string
+	Timeout        time.Duration
+	IsFiltered     bool
+}
+
+func NewAdapterByDB(client *mongo.Client, config *AdapterConfig) (persist.BatchAdapter, error) {
+	if config == nil {
+		config = &AdapterConfig{}
+	}
+	if config.CollectionName == "" {
+		config.CollectionName = defaultCollectionName
+	}
+	if config.DatabaseName == "" {
+		config.DatabaseName = defaultDatabaseName
+	}
+	if config.Timeout == 0 {
+		config.Timeout = defaultTimeout
+	}
+
+	a := &adapter{
+		client:     client,
+		collection: client.Database(config.DatabaseName).Collection(config.CollectionName),
+		timeout:    config.Timeout,
+		filtered:   config.IsFiltered,
+	}
+
+	// Call the destructor when the object is released.
+	runtime.SetFinalizer(a, finalizer)
+
+	return a, nil
+}
+
+func (a *adapter) open(clientOption *options.ClientOptions, databaseName string, collectionName string) error {
 	ctx, cancel := context.WithTimeout(context.TODO(), a.timeout)
 	defer cancel()
 
-	var err error
-
-	collection := a.Collection(ctx)
-	if collection == nil {
-		return errors.New("collection is nil")
+	client, err := mongo.Connect(ctx, clientOption)
+	if err != nil {
+		return err
 	}
 
+	db := client.Database(databaseName)
+	collection := db.Collection(collectionName)
+
+	a.client = client
+	a.collection = collection
+
 	indexes := []string{"ptype", "v0", "v1", "v2", "v3", "v4", "v5"}
-	keysDoc := bsonx.Doc{}
+	keysDoc := bson.D{}
 
 	for _, k := range indexes {
-		keysDoc = keysDoc.Append(k, bsonx.Int32(1))
+		keyDoc := bson.E{}
+		keyDoc.Key = k
+		keyDoc.Value = 1
+		keysDoc = append(keysDoc, keyDoc)
 	}
 
 	if _, err = collection.Indexes().CreateOne(
@@ -210,28 +212,21 @@ func (a *adapter) close() {
 	ctx, cancel := context.WithTimeout(context.TODO(), a.timeout)
 	defer cancel()
 
-	client := a.Client(ctx)
-	if client != nil {
-		client.Disconnect(ctx)
-	}
+	_ = a.client.Disconnect(ctx)
 }
 
 func (a *adapter) dropTable() error {
 	ctx, cancel := context.WithTimeout(context.TODO(), a.timeout)
 	defer cancel()
 
-	collection := a.Collection(ctx)
-	if collection == nil {
-		return fmt.Errorf("collection is nil")
-	}
-	err := collection.Drop(ctx)
+	err := a.collection.Drop(ctx)
 	if err != nil {
 		return err
 	}
 	return nil
 }
 
-func loadPolicyLine(line CasbinRule, model model.Model) {
+func loadPolicyLine(line CasbinRule, model model.Model) error {
 	var p = []string{line.PType,
 		line.V0, line.V1, line.V2, line.V3, line.V4, line.V5}
 	var lineText string
@@ -249,7 +244,7 @@ func loadPolicyLine(line CasbinRule, model model.Model) {
 		lineText = strings.Join(p[:2], ", ")
 	}
 
-	persist.LoadPolicyLine(lineText, model)
+	return persist.LoadPolicyLine(lineText, model)
 }
 
 // LoadPolicy loads policy from database.
@@ -266,27 +261,25 @@ func (a *adapter) LoadFilteredPolicy(model model.Model, filter interface{}) erro
 	} else {
 		a.filtered = true
 	}
-	line := CasbinRule{}
 
 	ctx, cancel := context.WithTimeout(context.TODO(), a.timeout)
 	defer cancel()
 
-	collection := a.Collection(ctx)
-	if collection == nil {
-		return fmt.Errorf("collection is nil")
-	}
-
-	cursor, err := collection.Find(ctx, filter)
+	cursor, err := a.collection.Find(ctx, filter)
 	if err != nil {
 		return err
 	}
 
 	for cursor.Next(ctx) {
+		line := CasbinRule{}
 		err := cursor.Decode(&line)
 		if err != nil {
 			return err
 		}
-		loadPolicyLine(line, model)
+		err = loadPolicyLine(line, model)
+		if err != nil {
+			return err
+		}
 	}
 
 	return cursor.Close(ctx)
@@ -351,12 +344,7 @@ func (a *adapter) SavePolicy(model model.Model) error {
 	ctx, cancel := context.WithTimeout(context.TODO(), a.timeout)
 	defer cancel()
 
-	collection := a.Collection(ctx)
-	if collection == nil {
-		return fmt.Errorf("collection is nil")
-	}
-
-	if _, err := collection.InsertMany(ctx, lines); err != nil {
+	if _, err := a.collection.InsertMany(ctx, lines); err != nil {
 		return err
 	}
 
@@ -370,12 +358,7 @@ func (a *adapter) AddPolicy(sec string, ptype string, rule []string) error {
 	ctx, cancel := context.WithTimeout(context.TODO(), a.timeout)
 	defer cancel()
 
-	collection := a.Collection(ctx)
-	if collection == nil {
-		return fmt.Errorf("collection is nil")
-	}
-
-	if _, err := collection.InsertOne(ctx, line); err != nil {
+	if _, err := a.collection.InsertOne(ctx, line); err != nil {
 		return err
 	}
 
@@ -384,29 +367,17 @@ func (a *adapter) AddPolicy(sec string, ptype string, rule []string) error {
 
 // AddPolicies adds policy rules to the storage.
 func (a *adapter) AddPolicies(sec string, ptype string, rules [][]string) error {
-	var collection *mongo.Collection
-	var ctx context.Context
-	var cancel context.CancelFunc
-
-	ctx, cancel = context.WithTimeout(context.TODO(), a.timeout)
-	defer cancel()
-
 	var lines []CasbinRule
 	for _, rule := range rules {
 		line := savePolicyLine(ptype, rule)
 		lines = append(lines, line)
 	}
 
-	if len(lines) > 0 {
-		collection = a.Collection(ctx)
-		if collection == nil {
-			return fmt.Errorf("collection is nil")
-		}
-
-		for _, line := range lines {
-			if _, err := collection.InsertOne(ctx, line); err != nil {
-				return err
-			}
+	for _, line := range lines {
+		ctx, cancel := context.WithTimeout(context.TODO(), a.timeout)
+		defer cancel()
+		if _, err := a.collection.InsertOne(ctx, line); err != nil {
+			return err
 		}
 	}
 
@@ -415,29 +386,17 @@ func (a *adapter) AddPolicies(sec string, ptype string, rules [][]string) error 
 
 // RemovePolicies removes policy rules from the storage.
 func (a *adapter) RemovePolicies(sec string, ptype string, rules [][]string) error {
-	var collection *mongo.Collection
-	var ctx context.Context
-	var cancel context.CancelFunc
-
-	ctx, cancel = context.WithTimeout(context.TODO(), a.timeout)
-	defer cancel()
-
 	var lines []CasbinRule
 	for _, rule := range rules {
 		line := savePolicyLine(ptype, rule)
 		lines = append(lines, line)
 	}
 
-	if len(lines) > 0 {
-		collection = a.Collection(ctx)
-		if collection == nil {
-			return fmt.Errorf("collection is nil")
-		}
-
-		for _, line := range lines {
-			if _, err := collection.DeleteOne(ctx, line); err != nil {
-				return err
-			}
+	for _, line := range lines {
+		ctx, cancel := context.WithTimeout(context.TODO(), a.timeout)
+		defer cancel()
+		if _, err := a.collection.DeleteOne(ctx, line); err != nil {
+			return err
 		}
 	}
 
@@ -451,12 +410,7 @@ func (a *adapter) RemovePolicy(sec string, ptype string, rule []string) error {
 	ctx, cancel := context.WithTimeout(context.TODO(), a.timeout)
 	defer cancel()
 
-	collection := a.Collection(ctx)
-	if collection == nil {
-		return fmt.Errorf("collection is nil")
-	}
-
-	if _, err := collection.DeleteOne(ctx, line); err != nil {
+	if _, err := a.collection.DeleteOne(ctx, line); err != nil {
 		return err
 	}
 
@@ -502,14 +456,224 @@ func (a *adapter) RemoveFilteredPolicy(sec string, ptype string, fieldIndex int,
 	ctx, cancel := context.WithTimeout(context.TODO(), a.timeout)
 	defer cancel()
 
-	collection := a.Collection(ctx)
-	if collection == nil {
-		return fmt.Errorf("collection is nil")
-	}
-
-	if _, err := collection.DeleteMany(ctx, selector); err != nil {
+	if _, err := a.collection.DeleteMany(ctx, selector); err != nil {
 		return err
 	}
 
 	return nil
+}
+
+// UpdatePolicy updates a policy rule from storage.
+// This is part of the Auto-Save feature.
+func (a *adapter) UpdatePolicy(sec string, ptype string, oldRule, newPolicy []string) error {
+	oldLine := savePolicyLine(ptype, oldRule)
+	newLine := savePolicyLine(ptype, newPolicy)
+
+	ctx, cancel := context.WithTimeout(context.TODO(), a.timeout)
+	defer cancel()
+	// Updating all the documents equals to replacing
+	_, err := a.collection.ReplaceOne(ctx, oldLine, newLine)
+	return err
+}
+
+// UpdatePolicies updates some policy rules to storage, like db, redis.
+func (a *adapter) UpdatePolicies(sec string, ptype string, oldRules, newRules [][]string) error {
+	oldLines := make([]CasbinRule, 0, len(oldRules))
+	newLines := make([]CasbinRule, 0, len(oldRules))
+	for _, oldRule := range oldRules {
+		oldLines = append(oldLines, savePolicyLine(ptype, oldRule))
+	}
+	for _, newRule := range newRules {
+		newLines = append(newLines, savePolicyLine(ptype, newRule))
+	}
+
+	ctx, cancel := context.WithTimeout(context.TODO(), a.timeout)
+	defer cancel()
+	for i := range oldRules {
+		_, err := a.collection.ReplaceOne(ctx, oldLines[i], newLines[i])
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// UpdateFilteredPolicies deletes old rules and adds new rules.
+func (a *adapter) UpdateFilteredPolicies(sec string, ptype string, newPolicies [][]string, fieldIndex int, fieldValues ...string) ([][]string, error) {
+	selector := make(map[string]interface{})
+	selector["ptype"] = ptype
+
+	if fieldIndex <= 0 && 0 < fieldIndex+len(fieldValues) {
+		if fieldValues[0-fieldIndex] != "" {
+			selector["v0"] = fieldValues[0-fieldIndex]
+		}
+	}
+	if fieldIndex <= 1 && 1 < fieldIndex+len(fieldValues) {
+		if fieldValues[1-fieldIndex] != "" {
+			selector["v1"] = fieldValues[1-fieldIndex]
+		}
+	}
+	if fieldIndex <= 2 && 2 < fieldIndex+len(fieldValues) {
+		if fieldValues[2-fieldIndex] != "" {
+			selector["v2"] = fieldValues[2-fieldIndex]
+		}
+	}
+	if fieldIndex <= 3 && 3 < fieldIndex+len(fieldValues) {
+		if fieldValues[3-fieldIndex] != "" {
+			selector["v3"] = fieldValues[3-fieldIndex]
+		}
+	}
+	if fieldIndex <= 4 && 4 < fieldIndex+len(fieldValues) {
+		if fieldValues[4-fieldIndex] != "" {
+			selector["v4"] = fieldValues[4-fieldIndex]
+		}
+	}
+	if fieldIndex <= 5 && 5 < fieldIndex+len(fieldValues) {
+		if fieldValues[5-fieldIndex] != "" {
+			selector["v5"] = fieldValues[5-fieldIndex]
+		}
+	}
+
+	oldLines := make([]CasbinRule, 0)
+	newLines := make([]CasbinRule, 0, len(newPolicies))
+	for _, newPolicy := range newPolicies {
+		newLines = append(newLines, savePolicyLine(ptype, newPolicy))
+	}
+
+	oldPolicies, err := a.updateFilteredPoliciesTxn(oldLines, newLines, selector)
+	if err == nil {
+		return oldPolicies, err
+	}
+	// (IllegalOperation) Transaction numbers are only allowed on a replica set member or mongos
+	if mongoErr, ok := err.(mongo.CommandError); !ok || mongoErr.Code != 20 {
+		return nil, err
+	}
+
+	log.Println("[WARNING]: As your mongodb server doesn't allow a replica set, transaction operation is not supported. So Casbin Adapter will run non-transactional updating!")
+	return a.updateFilteredPolicies(oldLines, newLines, selector)
+}
+
+func (a *adapter) updateFilteredPoliciesTxn(oldLines, newLines []CasbinRule, selector map[string]interface{}) ([][]string, error) {
+	ctx, cancel := context.WithTimeout(context.TODO(), a.timeout)
+	defer cancel()
+
+	session, err := a.client.StartSession()
+	if err != nil {
+		return nil, err
+	}
+	defer session.EndSession(context.TODO())
+
+	_, err = session.WithTransaction(ctx, func(sessionCtx mongo.SessionContext) (interface{}, error) {
+		// Load old policies
+		cursor, err := a.collection.Find(ctx, selector)
+		if err != nil {
+			_ = session.AbortTransaction(context.Background())
+			return nil, err
+		}
+		for cursor.Next(ctx) {
+			line := CasbinRule{}
+			err := cursor.Decode(&line)
+			if err != nil {
+				_ = session.AbortTransaction(context.Background())
+				return nil, err
+			}
+			oldLines = append(oldLines, line)
+		}
+		if err = cursor.Close(ctx); err != nil {
+			_ = session.AbortTransaction(context.Background())
+			return nil, err
+		}
+
+		// Delete all old policies
+		if _, err := a.collection.DeleteMany(sessionCtx, selector); err != nil {
+			_ = session.AbortTransaction(context.Background())
+			return nil, err
+		}
+		// Insert new policies
+		for _, newLine := range newLines {
+			if _, err := a.collection.InsertOne(sessionCtx, &newLine); err != nil {
+				_ = session.AbortTransaction(context.Background())
+				return nil, err
+			}
+		}
+		return nil, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// return deleted rulues
+	oldPolicies := make([][]string, 0)
+	for _, v := range oldLines {
+		oldPolicy := v.toStringPolicy()
+		oldPolicies = append(oldPolicies, oldPolicy)
+	}
+	return oldPolicies, nil
+}
+
+func (a *adapter) updateFilteredPolicies(oldLines, newLines []CasbinRule, selector map[string]interface{}) ([][]string, error) {
+	ctx, cancel := context.WithTimeout(context.TODO(), a.timeout)
+	defer cancel()
+
+	// Load old policies
+	cursor, err := a.collection.Find(ctx, selector)
+	if err != nil {
+		return nil, err
+	}
+	for cursor.Next(ctx) {
+		line := CasbinRule{}
+		err := cursor.Decode(&line)
+		if err != nil {
+			return nil, err
+		}
+		oldLines = append(oldLines, line)
+	}
+	if err = cursor.Close(ctx); err != nil {
+		return nil, err
+	}
+
+	// Delete all old policies
+	if _, err := a.collection.DeleteMany(ctx, selector); err != nil {
+		return nil, err
+	}
+	// Insert new policies
+	for _, newLine := range newLines {
+		if _, err := a.collection.InsertOne(ctx, &newLine); err != nil {
+			return nil, err
+		}
+	}
+
+	// return deleted rulues
+	oldPolicies := make([][]string, 0)
+	for _, v := range oldLines {
+		oldPolicy := v.toStringPolicy()
+		oldPolicies = append(oldPolicies, oldPolicy)
+	}
+	return oldPolicies, nil
+}
+
+func (c *CasbinRule) toStringPolicy() []string {
+	policy := make([]string, 0)
+	if c.PType != "" {
+		policy = append(policy, c.PType)
+	}
+	if c.V0 != "" {
+		policy = append(policy, c.V0)
+	}
+	if c.V1 != "" {
+		policy = append(policy, c.V1)
+	}
+	if c.V2 != "" {
+		policy = append(policy, c.V2)
+	}
+	if c.V3 != "" {
+		policy = append(policy, c.V3)
+	}
+	if c.V4 != "" {
+		policy = append(policy, c.V4)
+	}
+	if c.V5 != "" {
+		policy = append(policy, c.V5)
+	}
+	return policy
 }
